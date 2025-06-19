@@ -10,6 +10,7 @@ const SWAP_MAX: &str = "memory.swap.max";
 const SWAP_CURRENT: &str = "memory.swap.current";
 const WINDOW_SIZE: usize = 30; // Size of the sliding window for standard deviation calculation
 const STDDEV_THRESHOLD: f64 = 1.0; // Threshold for standard deviation to trigger proactive reclaim
+const CGROUPS_MAX_RECLAIM: u64 = 100 * 1024 * 1024; // Maximum reclaim value for cgroups
 
 struct MemoryStat {
     inactive_anon: u64,
@@ -18,8 +19,7 @@ struct MemoryStat {
     active_file: u64,
 }
 
-struct CgroupsReclaimManager {
-    threshold: u64, // Threshold for proactive reclaim 
+pub struct CgroupsReclaimManager {
     cgroup_path: String, // Path to the cgroup
 
     current_memory_usage: u64, // Current memory usage
@@ -39,9 +39,8 @@ struct CgroupsReclaimManager {
 }
 
 impl CgroupsReclaimManager {
-    pub fn new(cgroup_path: &str, threshold: u64) -> Self {
+    pub fn new(cgroup_path: &str) -> Self {
         CgroupsReclaimManager {
-            threshold: threshold, // Default threshold
             cgroup_path: cgroup_path.to_string(),
             current_memory_usage: 0,
             current_swap_usage: 0,
@@ -61,10 +60,6 @@ impl CgroupsReclaimManager {
             swap_current_path: format!("{}/{}", cgroup_path, SWAP_CURRENT),
             window: Vec::with_capacity(WINDOW_SIZE), // Initialize sliding window
         }
-    }
-
-    fn set_threshold(&mut self, threshold: u64) {
-        self.threshold = threshold;
     }
 
     fn stddev(&self, values: &[f64]) -> f64 {
@@ -92,10 +87,10 @@ impl CgroupsReclaimManager {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() == 2 {
                 match parts[0] {
-                    "inactive_anon" => self.memory_stat.inactive_anon = parts[1].parse().unwrap_or(0),
-                    "active_anon" => self.memory_stat.active_anon = parts[1].parse().unwrap_or(0),
-                    "inactive_file" => self.memory_stat.inactive_file = parts[1].parse().unwrap_or(0),
-                    "active_file" => self.memory_stat.active_file = parts[1].parse().unwrap_or(0),
+                    "inactive_anon" => self.memory_stat.inactive_anon = parts[1].trim().parse().unwrap_or(0),
+                    "active_anon" => self.memory_stat.active_anon = parts[1].trim().parse().unwrap_or(0),
+                    "inactive_file" => self.memory_stat.inactive_file = parts[1].trim().parse().unwrap_or(0),
+                    "active_file" => self.memory_stat.active_file = parts[1].trim().parse().unwrap_or(0),
                     _ => {}
                 }
             }
@@ -104,19 +99,20 @@ impl CgroupsReclaimManager {
         // Read memory current usage
         let contents = fs::read_to_string(self.memory_current_path.clone())
             .expect("Should have been able to read the file");
-        self.current_memory_usage = contents.parse::<u64>().unwrap();
+        self.current_memory_usage = contents.trim().parse::<u64>().unwrap_or(0);
         // Read swap current usage
         let contents = fs::read_to_string(self.swap_current_path.clone())
             .expect("Should have been able to read the file");
-        self.current_swap_usage = contents.parse::<u64>().unwrap();
+        self.current_swap_usage = contents.trim().parse::<u64>().unwrap_or(0);
         // Read memory max
         let contents = fs::read_to_string(self.memory_max_path.clone())
             .expect("Should have been able to read the file");
-        self.memory_max = contents.parse::<u64>().unwrap();
+        self.memory_max = contents.trim().parse::<u64>().unwrap_or(0);
         // Read swap max
         let contents = fs::read_to_string(self.swap_max_path.clone())
             .expect("Should have been able to read the file");
-        self.swap_max = contents.parse::<u64>().unwrap();
+        self.swap_max = contents.trim().parse::<u64>().unwrap_or(0);
+
 
         Ok(())
     }   
@@ -139,21 +135,24 @@ impl CgroupsReclaimManager {
         1024 * 1024 * 15 // 15 MB
     }
 
-    pub fn proactive_reclaim(&mut self, free_memory: u64, threshold: u64) -> Result<(), String> {
+    pub fn regulate(&mut self, free_memory: u64, safety: u64) -> Result<(), String> {
         // Placeholder for proactive reclaim logic
         // This would involve checking the cgroup's resource usage and reclaiming if necessary
 
         self.get_statistics()?;
+
+        let unused = self.current_memory_usage - free_memory;
+
         self.update_window();
 
-        if free_memory < threshold {
-            // Error::new(io::ErrorKind::Other, "Free memory below threshold")
-            println!("Free memory below threshold, not reclaiming memory");
+        if unused < safety {
+            // Error::new(io::ErrorKind::Other, "Free memory below safety")
+            println!("Unused memory below safety, not reclaiming memory");
         } else {
             // Perform reclaim logic
-            self.reclaim_memory(free_memory)?;
-            let inactive_anon = self.memory_stat.inactive_anon / (1024*1024); // Convert to MB
+            let inactive_anon = self.memory_stat.inactive_anon; // Convert to MB
 
+            // create inactive list
             if inactive_anon == 0 {
                 self.reclaim_memory(self.get_initial_memory_reclaim())?;
                 return Ok(());
@@ -169,7 +168,7 @@ impl CgroupsReclaimManager {
 
             if stddev < STDDEV_THRESHOLD {
                 println!("Standard deviation is above threshold, reclaiming memory");
-                self.reclaim_memory(cmp::min(100, free_memory - threshold))?;
+                self.reclaim_memory(cmp::min(CGROUPS_MAX_RECLAIM, unused - safety))?;
                 self.window.clear(); // Clear the window after reclaim
             }
         }
@@ -177,6 +176,26 @@ impl CgroupsReclaimManager {
         Ok(())
     }
     // Add methods to manage cgroups and reclaim resources
+}
+
+pub fn get_cgroup_path(domain_name: &str) -> Result<String,()> {
+    const CGROUP_BASE_PATH: &str = "/sys/fs/cgroup/machine.slice";
+    let pattern = format!("{}.scope", domain_name);
+
+    if let Ok(entries) = fs::read_dir(CGROUP_BASE_PATH) {
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if path.is_dir() && path.to_string_lossy().contains(&pattern) {
+                    return Ok(path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    // If no matching cgroup is found, return an empty string or handle the error as needed
+    println!("No matching cgroup found for domain: {}", domain_name);
+    Err(())
 }
 
 #[cfg(test)]
