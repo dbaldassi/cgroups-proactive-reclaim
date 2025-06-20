@@ -2,6 +2,9 @@
 use std::{fs, cmp};
 use std::io::{self, BufRead};
 
+use csv::Writer;
+use chrono::Local;
+
 const MEMORY_MAX: &str = "memory.max";
 const MEMORY_CURRENT: &str = "memory.current";
 const MEMORY_STAT: &str = "memory.stat";
@@ -12,20 +15,34 @@ const WINDOW_SIZE: usize = 30; // Size of the sliding window for standard deviat
 const STDDEV_THRESHOLD: f64 = 1.0; // Threshold for standard deviation to trigger proactive reclaim
 const CGROUPS_MAX_RECLAIM: u64 = 100 * 1024 * 1024; // Maximum reclaim value for cgroups
 
+#[derive(serde::Serialize, Default)]
 struct MemoryStat {
     inactive_anon: u64,
     active_anon: u64,
     inactive_file: u64,
     active_file: u64,
-}
-
-pub struct CgroupsReclaimManager {
-    cgroup_path: String, // Path to the cgroup
-
     current_memory_usage: u64, // Current memory usage
     current_swap_usage: u64, // Current swap usage
     memory_max: u64, // Maximum memory limit
     swap_max: u64, // Maximum swap limit
+}
+
+#[derive(serde::Serialize, Default)]
+struct LogEntry {
+    timestamp: u64,
+    current_memory_usage: u64, // Current memory usage
+    current_swap_usage: u64, // Current swap usage
+    memory_max: u64, // Maximum memory limit
+    active_anon: u64,
+    inactive_anon: u64,
+    swap_max: u64, // Maximum swap limit
+    active_file: u64,
+    inactive_file: u64,
+}
+
+pub struct CgroupsReclaimManager {
+    domain: String, // Path to the cgroup
+
     memory_stat: MemoryStat, // Memory statistics for standard deviation calculation
 
     memory_max_path: String, // Path to memory.max
@@ -35,22 +52,21 @@ pub struct CgroupsReclaimManager {
     swap_max_path: String, // Path to memory.swap.max
     swap_current_path: String, // Path to memory.swap.current
 
+    logger: Option<csv::Writer<std::fs::File>>, // Optional CSV logger for memory statistics
+
     window: Vec<f64>, // Sliding window for standard deviation calculation
 }
 
 impl CgroupsReclaimManager {
-    pub fn new(cgroup_path: &str) -> Self {
+    pub fn new(domain: &str) -> Self {
+        let cgroup_path = get_cgroup_path(domain).unwrap_or_else(|_| {
+            panic!("Failed to get cgroup path for domain: {}", domain);
+        });
+
         CgroupsReclaimManager {
-            cgroup_path: cgroup_path.to_string(),
-            current_memory_usage: 0,
-            current_swap_usage: 0,
-            memory_max: 0,
-            swap_max: 0,
+            domain: domain.to_string(),
             memory_stat: MemoryStat {
-                inactive_anon: 0,
-                active_anon: 0,
-                inactive_file: 0,
-                active_file: 0,
+                ..MemoryStat::default() // Initialize memory statistics
             },
             memory_max_path: format!("{}/{}", cgroup_path, MEMORY_MAX),
             memory_current_path: format!("{}/{}", cgroup_path, MEMORY_CURRENT),
@@ -59,6 +75,7 @@ impl CgroupsReclaimManager {
             swap_max_path: format!("{}/{}", cgroup_path, SWAP_MAX),
             swap_current_path: format!("{}/{}", cgroup_path, SWAP_CURRENT),
             window: Vec::with_capacity(WINDOW_SIZE), // Initialize sliding window
+            logger: None, // Initialize logger as None
         }
     }
 
@@ -99,19 +116,19 @@ impl CgroupsReclaimManager {
         // Read memory current usage
         let contents = fs::read_to_string(self.memory_current_path.clone())
             .expect("Should have been able to read the file");
-        self.current_memory_usage = contents.trim().parse::<u64>().unwrap_or(0);
+        self.memory_stat.current_memory_usage = contents.trim().parse::<u64>().unwrap_or(0);
         // Read swap current usage
         let contents = fs::read_to_string(self.swap_current_path.clone())
             .expect("Should have been able to read the file");
-        self.current_swap_usage = contents.trim().parse::<u64>().unwrap_or(0);
+        self.memory_stat.current_swap_usage = contents.trim().parse::<u64>().unwrap_or(0);
         // Read memory max
         let contents = fs::read_to_string(self.memory_max_path.clone())
             .expect("Should have been able to read the file");
-        self.memory_max = contents.trim().parse::<u64>().unwrap_or(0);
+        self.memory_stat.memory_max = contents.trim().parse::<u64>().unwrap_or(0);
         // Read swap max
         let contents = fs::read_to_string(self.swap_max_path.clone())
             .expect("Should have been able to read the file");
-        self.swap_max = contents.trim().parse::<u64>().unwrap_or(0);
+        self.memory_stat.swap_max = contents.trim().parse::<u64>().unwrap_or(0);
 
 
         Ok(())
@@ -141,7 +158,7 @@ impl CgroupsReclaimManager {
 
         self.get_statistics()?;
 
-        let unused = self.current_memory_usage - free_memory;
+        let unused = self.memory_stat.current_memory_usage - free_memory;
 
         self.update_window();
 
@@ -175,6 +192,39 @@ impl CgroupsReclaimManager {
         
         Ok(())
     }
+
+    fn create_csv_writer(&mut self) {
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+
+        let path =  format!("cgroup_{}_{}.csv", &self.domain, timestamp);
+        let file = std::fs::File::create(path).expect("Failed to create CSV file");
+        self.logger = Some(Writer::from_writer(file));
+    }
+
+    pub fn dump_mem_stats(&mut self, timestamp: u64) {
+        if self.logger.is_none() {
+            self.create_csv_writer();
+        }
+
+        if let Some(ref mut logger) = self.logger {
+            let log_entry = LogEntry {
+                timestamp,
+                current_memory_usage: self.memory_stat.current_memory_usage,
+                current_swap_usage: self.memory_stat.current_swap_usage,
+                memory_max: self.memory_stat.memory_max,
+                active_anon: self.memory_stat.active_anon,  
+                inactive_anon: self.memory_stat.inactive_anon,
+                swap_max: self.memory_stat.swap_max,
+                active_file: self.memory_stat.active_file,
+                inactive_file: self.memory_stat.inactive_file,
+            };
+
+            logger.serialize(log_entry).expect("Failed to write to CSV");
+        } else {
+            println!("Logger not initialized, cannot dump memory stats");
+        }    
+    }
+    
     // Add methods to manage cgroups and reclaim resources
 }
 
